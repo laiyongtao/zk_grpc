@@ -1,34 +1,27 @@
 # coding=utf-8
-
-# coding=utf-8
-
 import random
 import threading
-import asyncio
+from typing import Type
 from inspect import isclass
-from asyncio import iscoroutinefunction
-from collections import defaultdict, namedtuple
+from collections import defaultdict
+
+import grpc
+from grpc._server import _Server
 from kazoo.client import KazooClient
-from kazoo.protocol.states import EventType
+from kazoo.protocol.states import EventType, WatchedEvent
 
-from grpc import insecure_channel
-from grpc.experimental.aio import insecure_channel as insecure_aio_channel
-
-ZK_ROOT_PATH = "/zk_grpc"
-SNODE_PREFIX = "server"
-
-Server = namedtuple("Server", "channel addr")
-
-class NoServerAvailable(Exception):
-    pass
+from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
+                         Server,
+                         NoServerAvailable,
+                         StubType)
 
 
 class ZKGrpc(object):
 
-
-    def __init__(self, kz_client, zk_root_path = ZK_ROOT_PATH, node_prefix=SNODE_PREFIX,
-                 channel_factory=insecure_channel, channel_factory_kwargs=None):
-        self._kz_client: KazooClient  = kz_client
+    def __init__(self, kz_client: KazooClient,
+                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
+                 channel_factory = grpc.insecure_channel, channel_factory_kwargs: dict = None):
+        self._kz_client = kz_client
         self.zk_root_path = zk_root_path
         self.node_prefix = node_prefix
 
@@ -38,39 +31,32 @@ class ZKGrpc(object):
         self.services = defaultdict(dict)
         self._locks = defaultdict(threading.RLock)
 
-
-
-
-
-    def init_stub(self, stub_class, service_name=None):
+    def init_stub(self, stub_class: Type[StubType], service_name: str = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
 
-
         channel = self.get_channel(service_name)
         return stub_class(channel)
 
-    def _split_service_name(self, service_path):
+    def _split_service_name(self, service_path: str):
         return service_path.rsplit("/", 1)[-1]
 
-    def _split_server_name(self, server_path):
+    def _split_server_name(self, server_path: str):
         service_path, server_name = server_path.rsplit("/", 1)
         service_name = self._split_service_name(service_path)
         return service_path, service_name, server_name
 
-    def _remove_channel(self, server):
+    def _remove_channel(self, server: Server):
         if server and isinstance(server, Server):
             ch = server.channel
-            if iscoroutinefunction(ch.close):
-                asyncio.create_task(ch.close())
-            else:
-                ch.close()
+            ch.close()
 
-    def child_watcher(self, event):
+    def child_watcher(self, event: WatchedEvent):
         service_name = self._split_service_name(event.path)
 
         if event.type == EventType.CHILD:
+            # update
             childs = self._kz_client.get_children(event.path, watch=self.child_watcher)
             with self._locks[service_name]:
                 fetched_servers = self.services[service_name].keys()
@@ -85,7 +71,6 @@ class ZKGrpc(object):
             for _ser in _sers:
                 self._remove_channel(_ser)
 
-            # update
         elif event.type == EventType.DELETED:
             # delete
             with self._locks[service_name]:
@@ -94,7 +79,7 @@ class ZKGrpc(object):
             for _ser in _sers:
                 self._remove_channel(_ser)
 
-    def child_value_watcher(self, event):
+    def child_value_watcher(self, event: WatchedEvent):
         if event.type == EventType.CHANGED:
             # update
             service_path, service_name, server_name = self._split_server_name(event.path)
@@ -110,8 +95,6 @@ class ZKGrpc(object):
         data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
         server_addr = data.decode("utf-8")
 
-
-
         ori_ser_info = self.services[service_name].get(child_name)
         if ori_ser_info and isinstance(ori_ser_info, Server):
             ori_addr = ori_ser_info.addr
@@ -121,10 +104,9 @@ class ZKGrpc(object):
         self.services[service_name].update({child_name: Server(channel=channel, addr=server_addr)})
 
         if isinstance(event, threading.Event) and not event.is_set():
-
             event.set()
 
-    def fetch_servers(self, service_name):
+    def fetch_servers(self, service_name: str):
 
         service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
         self._kz_client.ensure_path(service_path)
@@ -146,8 +128,7 @@ class ZKGrpc(object):
         # wait for first value
         _event.wait()  # Todo: set timeout
 
-
-    def get_channel(self, service_name):
+    def get_channel(self, service_name: str):
         service = self.services.get(service_name)
         if service is None:
 
@@ -162,8 +143,8 @@ class ZKGrpc(object):
         return self._get_channel(service, service_name)
 
     def _get_channel(self,
-                     service_map, # type: dict
-                     service_name
+                     service_map: dict,
+                     service_name: str
                      ):
 
         servers = service_map.keys()
@@ -173,10 +154,10 @@ class ZKGrpc(object):
         return service_map[server].channel
 
 
-
 class ZKRegister(object):
 
-    def __init__(self, kz_client, zk_root_path = ZK_ROOT_PATH, node_prefix=SNODE_PREFIX):
+    def __init__(self, kz_client: KazooClient,
+                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX):
 
         self._kz_client = kz_client
         self.zk_root_path = zk_root_path
@@ -185,13 +166,13 @@ class ZKRegister(object):
         self._creted_nodes = set()
         self._services = set()
 
-    def register_grpc_server(self, server, host, port):
+    def register_grpc_server(self, server: grpc._server._Server, host: str, port: int):
         value_str = "{}:{}".format(host, port)
         for s in server._state.generic_handlers:
             service_name = s.service_name()
             self._create_server_node(service_name=service_name, value=value_str)
 
-    def register_server(self, service, host, port):
+    def register_server(self, service, host: str, port: int):
         value_str = "{}:{}".format(host, port)
 
         if isclass(service):
@@ -202,7 +183,7 @@ class ZKRegister(object):
 
         self._create_server_node(service_name=service_name, value=value_str)
 
-    def _create_server_node(self, service_name, value):
+    def _create_server_node(self, service_name: str, value: bytes):
         if not isinstance(value, bytes):
             value = value.encode("utf-8")
         service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
@@ -220,6 +201,3 @@ class ZKRegister(object):
             rets.append(ret)
         for ret in rets:
             ret.get()
-
-
-
