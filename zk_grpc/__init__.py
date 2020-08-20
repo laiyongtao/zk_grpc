@@ -1,7 +1,7 @@
 # coding=utf-8
 import random
 import threading
-from typing import Type
+from typing import Union
 from inspect import isclass
 from collections import defaultdict
 
@@ -11,16 +11,17 @@ from kazoo.client import KazooClient
 from kazoo.protocol.states import EventType, WatchedEvent
 
 from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
-                         Server,
+                         ServerInfo,
                          NoServerAvailable,
-                         StubType)
+                         StubClass, ServicerClass)
 
 
 class ZKGrpc(object):
 
     def __init__(self, kz_client: KazooClient,
                  zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
-                 channel_factory = grpc.insecure_channel, channel_factory_kwargs: dict = None):
+                 channel_factory: Union[grpc.insecure_channel, grpc.secure_channel] = grpc.insecure_channel,
+                 channel_factory_kwargs: dict = None):
         self._kz_client = kz_client
         self.zk_root_path = zk_root_path
         self.node_prefix = node_prefix
@@ -31,7 +32,7 @@ class ZKGrpc(object):
         self.services = defaultdict(dict)
         self._locks = defaultdict(threading.RLock)
 
-    def init_stub(self, stub_class: Type[StubType], service_name: str = None):
+    def init_stub(self, stub_class: StubClass, service_name: str = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
@@ -47,8 +48,8 @@ class ZKGrpc(object):
         service_name = self._split_service_name(service_path)
         return service_path, service_name, server_name
 
-    def _remove_channel(self, server: Server):
-        if server and isinstance(server, Server):
+    def _remove_channel(self, server: ServerInfo):
+        if server and isinstance(server, ServerInfo):
             ch = server.channel
             ch.close()
 
@@ -90,18 +91,18 @@ class ZKGrpc(object):
             # do nothing, child_watcher will handle all the things
             pass
 
-    def set_channel(self, service_path, child_name, service_name, event=None):
+    def set_channel(self, service_path: str, child_name: str, service_name: str, event=Union[None, threading.Event]):
         child_path = "/".join((service_path, child_name))
         data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
         server_addr = data.decode("utf-8")
 
         ori_ser_info = self.services[service_name].get(child_name)
-        if ori_ser_info and isinstance(ori_ser_info, Server):
+        if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
             ori_addr = ori_ser_info.addr
             if server_addr == ori_addr: return
 
         channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
-        self.services[service_name].update({child_name: Server(channel=channel, addr=server_addr)})
+        self.services[service_name].update({child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path)})
 
         if isinstance(event, threading.Event) and not event.is_set():
             event.set()
@@ -172,7 +173,7 @@ class ZKRegister(object):
             service_name = s.service_name()
             self._create_server_node(service_name=service_name, value=value_str)
 
-    def register_server(self, service, host: str, port: int):
+    def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
         value_str = "{}:{}".format(host, port)
 
         if isclass(service):
@@ -183,7 +184,7 @@ class ZKRegister(object):
 
         self._create_server_node(service_name=service_name, value=value_str)
 
-    def _create_server_node(self, service_name: str, value: bytes):
+    def _create_server_node(self, service_name: str, value: Union[str, bytes]):
         if not isinstance(value, bytes):
             value = value.encode("utf-8")
         service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
@@ -195,7 +196,6 @@ class ZKRegister(object):
 
     def shutdown(self):
         rets = list()
-        print("nodes: ", self._creted_nodes)
         for node in self._creted_nodes:
             ret = self._kz_client.delete_async(node)
             rets.append(ret)
