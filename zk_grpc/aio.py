@@ -2,14 +2,12 @@
 import random
 import asyncio
 import threading
-from typing import Union
+from typing import Union, Optional
 from inspect import isclass
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
-import grpc
-from grpc._server import _Server
-from grpc.experimental.aio import insecure_channel, secure_channel
+import grpc.experimental.aio
 from kazoo.client import KazooClient
 from kazoo.protocol.states import EventType, WatchedEvent
 
@@ -26,19 +24,34 @@ class AIOZKGrpc(object):
                  channel_factory: Union[
                      grpc.experimental.aio.insecure_channel, grpc.experimental.aio.secure_channel
                  ] = grpc.experimental.aio.insecure_channel,
-                 channel_factory_kwargs: dict = None):
+                 channel_factory_kwargs: dict = None,
+                 grace: Optional[float]=None,
+                 thread_pool: Optional[ThreadPoolExecutor] = None,
+                 loop: Optional[asyncio.AbstractEventLoop] = None):
+
         self._kz_client = kz_client
         self.zk_root_path = zk_root_path
         self.node_prefix = node_prefix
 
         self.channel_factory = channel_factory
         self.channel_factory_kwargs = channel_factory_kwargs or {}
+        self.channel_grace = grace
 
         self.services = defaultdict(dict)
         self._locks = defaultdict(threading.RLock)
-        self._thread_pool = ThreadPoolExecutor()
 
-    async def init_stub(self, stub_class: StubClass, service_name: str = None):
+        self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
+        self._loop = loop
+
+    @property
+    def loop(self):
+        return self._loop
+
+    @loop.setter
+    def loop(self, value):
+        self._loop = value
+
+    async def wrap_stub(self, stub_class: StubClass, service_name: str = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
@@ -54,14 +67,15 @@ class AIOZKGrpc(object):
         service_name = self._split_service_name(service_path)
         return service_path, service_name, server_name
 
-    def _remove_channel(self, server: ServerInfo):
+    async def _close_channel(self, server: ServerInfo):
         if server and isinstance(server, ServerInfo):
             ch = server.channel
-            ch.close()
+            await ch.close(self.channel_grace)
 
     def child_watcher(self, event: WatchedEvent):
-        service_name = self._split_service_name(event.path)
+        asyncio.set_event_loop(self.loop)
 
+        service_name = self._split_service_name(event.path)
         if event.type == EventType.CHILD:
             # update
             childs = self._kz_client.get_children(event.path, watch=self.child_watcher)
@@ -75,18 +89,27 @@ class AIOZKGrpc(object):
                     self.set_channel(service_path=event.path, child_name=server, service_name=service_name)
 
                 _sers = [self.services[service_name].pop(server, None) for server in expr_servers]
+
+            fus = list()
             for _ser in _sers:
-                self._remove_channel(_ser)
+                fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
+                fus.append(fu)
+            wait(fus)
 
         elif event.type == EventType.DELETED:
             # delete
             with self._locks[service_name]:
                 _sers = self.services.pop(service_name, [])
                 self._locks.pop(service_name, None)
+            fus = list()
             for _ser in _sers:
-                self._remove_channel(_ser)
+                fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
+                fus.append(fu)
+            wait(fus)
 
     def child_value_watcher(self, event: WatchedEvent):
+        asyncio.set_event_loop(self.loop)
+
         if event.type == EventType.CHANGED:
             # update
             service_path, service_name, server_name = self._split_server_name(event.path)
@@ -97,7 +120,11 @@ class AIOZKGrpc(object):
             # do nothing, child_watcher will handle all the things
             pass
 
-    def set_channel(self, service_path: str, child_name: str, service_name: str):
+    def set_channel(self, service_path: str, child_name: str, service_name: str,
+                    loop: Optional[asyncio.AbstractEventLoop]= None):
+        if loop is not None:
+            asyncio.set_event_loop(loop)
+
         child_path = "/".join((service_path, child_name))
         data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
         server_addr = data.decode("utf-8")
@@ -123,9 +150,10 @@ class AIOZKGrpc(object):
         new_fus = list()
         for child in childs:
             fu = self._thread_pool.submit(self.set_channel,
-                                          kwargs={"service_path": service_path,
-                                                  "child_name": child,
-                                                  "service_name": service_name})
+                                          service_path=service_path,
+                                          child_name=child,
+                                          service_name=service_name,
+                                          loop=self.loop)
             new_fu = asyncio.wrap_future(fu)
             new_fus.append(new_fu)
 
@@ -146,10 +174,7 @@ class AIOZKGrpc(object):
 
         return self._get_channel(service, service_name)
 
-    def _get_channel(self,
-                     service_map: dict,
-                     service_name: str
-                     ):
+    def _get_channel(self, service_map: dict, service_name: str):
 
         servers = service_map.keys()
         if not servers:
@@ -157,11 +182,19 @@ class AIOZKGrpc(object):
         server = random.choice(list(servers))
         return service_map[server].channel
 
+    async def stop(self):
+        servers = list()
+        for _, _sers in self.services.items():
+            servers.extend((self._close_channel(_ser) for _ser in _sers))
+        self.services.clear()
+        await asyncio.wait(servers)
+
 
 class AIOZKRegister(object):
 
     def __init__(self, kz_client: KazooClient,
-                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX):
+                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
+                 thread_pool: Optional[ThreadPoolExecutor] = None):
 
         self._kz_client = kz_client
         self.zk_root_path = zk_root_path
@@ -170,7 +203,9 @@ class AIOZKRegister(object):
         self._creted_nodes = set()
         self._services = set()
 
-    def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
+        self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
+
+    async def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
         value_str = "{}:{}".format(host, port)
 
         if isclass(service):
@@ -178,8 +213,10 @@ class AIOZKRegister(object):
             service_name = "".join(class_name.rsplit("Servicer", 1))
         else:
             service_name = str(service)
-
-        self._create_server_node(service_name=service_name, value=value_str)
+        fu = self._thread_pool.submit(self._create_server_node,
+                                      service_name=service_name,
+                                      value=value_str)
+        await asyncio.wrap_future(fu)
 
     def _create_server_node(self, service_name: str, value: Union[str, bytes]):
         if not isinstance(value, bytes):
@@ -191,10 +228,10 @@ class AIOZKRegister(object):
         path = self._kz_client.create(path, value, ephemeral=True, sequence=True)
         self._creted_nodes.add(path)
 
-    def shutdown(self):
-        rets = list()
+    async def stop(self):
+        fus = list()
         for node in self._creted_nodes:
-            ret = self._kz_client.delete_async(node)
-            rets.append(ret)
-        for ret in rets:
-            ret.get()
+            fu = self._thread_pool.submit(self._kz_client.delete, node)
+            new_fu = asyncio.wrap_future(fu)
+            fus.append(new_fu)
+        await asyncio.wait(fus)

@@ -6,6 +6,7 @@ from inspect import isclass
 from collections import defaultdict
 
 import grpc
+import grpc.experimental.aio
 from grpc._server import _Server
 from kazoo.client import KazooClient
 from kazoo.protocol.states import EventType, WatchedEvent
@@ -32,7 +33,7 @@ class ZKGrpc(object):
         self.services = defaultdict(dict)
         self._locks = defaultdict(threading.RLock)
 
-    def init_stub(self, stub_class: StubClass, service_name: str = None):
+    def wrap_stub(self, stub_class: StubClass, service_name: str = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
@@ -48,7 +49,7 @@ class ZKGrpc(object):
         service_name = self._split_service_name(service_path)
         return service_path, service_name, server_name
 
-    def _remove_channel(self, server: ServerInfo):
+    def _close_channel(self, server: ServerInfo):
         if server and isinstance(server, ServerInfo):
             ch = server.channel
             ch.close()
@@ -70,7 +71,7 @@ class ZKGrpc(object):
 
                 _sers = [self.services[service_name].pop(server, None) for server in expr_servers]
             for _ser in _sers:
-                self._remove_channel(_ser)
+                self._close_channel(_ser)
 
         elif event.type == EventType.DELETED:
             # delete
@@ -78,7 +79,7 @@ class ZKGrpc(object):
                 _sers = self.services.pop(service_name, [])
                 self._locks.pop(service_name, None)
             for _ser in _sers:
-                self._remove_channel(_ser)
+                self._close_channel(_ser)
 
     def child_value_watcher(self, event: WatchedEvent):
         if event.type == EventType.CHANGED:
@@ -154,6 +155,11 @@ class ZKGrpc(object):
         server = random.choice(list(servers))
         return service_map[server].channel
 
+    def stop(self):
+        for _, _sers in self.services.items():
+            for _ser in _sers:
+                self._close_channel(_ser)
+
 
 class ZKRegister(object):
 
@@ -194,7 +200,7 @@ class ZKRegister(object):
         path = self._kz_client.create(path, value, ephemeral=True, sequence=True)
         self._creted_nodes.add(path)
 
-    def shutdown(self):
+    def stop(self):
         rets = list()
         for node in self._creted_nodes:
             ret = self._kz_client.delete_async(node)
