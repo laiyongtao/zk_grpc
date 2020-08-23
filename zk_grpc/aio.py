@@ -1,23 +1,20 @@
 # coding=utf-8
-import random
 import asyncio
-import threading
-from typing import Union, Optional
+from typing import Union, Optional, List
 from inspect import isclass
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
 import grpc.experimental.aio
 from kazoo.client import KazooClient
-from kazoo.protocol.states import EventType, WatchedEvent
 
 from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
                          StubClass, ServicerClass)
+from . import ZKGrpcMixin
 
 
-class AIOZKGrpc(object):
+class AIOZKGrpc(ZKGrpcMixin):
 
     def __init__(self, kz_client: KazooClient,
                  zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
@@ -25,23 +22,17 @@ class AIOZKGrpc(object):
                      grpc.experimental.aio.insecure_channel, grpc.experimental.aio.secure_channel
                  ] = grpc.experimental.aio.insecure_channel,
                  channel_factory_kwargs: dict = None,
-                 grace: Optional[float]=None,
+                 grace: Optional[float] = None,
                  thread_pool: Optional[ThreadPoolExecutor] = None,
                  loop: Optional[asyncio.AbstractEventLoop] = None):
 
-        self._kz_client = kz_client
-        self.zk_root_path = zk_root_path
-        self.node_prefix = node_prefix
-
-        self.channel_factory = channel_factory
-        self.channel_factory_kwargs = channel_factory_kwargs or {}
+        super(AIOZKGrpc, self).__init__(kz_client=kz_client,
+                                        zk_root_path=zk_root_path, node_prefix=node_prefix,
+                                        channel_factory=channel_factory, channel_factory_kwargs=channel_factory_kwargs,
+                                        thread_pool=thread_pool)
         self.channel_grace = grace
-
-        self.services = defaultdict(dict)
-        self._locks = defaultdict(threading.RLock)
-
-        self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
         self._loop = loop
+        self._is_aio = True
 
     @property
     def loop(self):
@@ -59,111 +50,55 @@ class AIOZKGrpc(object):
         channel = await self.get_channel(service_name)
         return stub_class(channel)
 
-    def _split_service_name(self, service_path: str):
-        return service_path.rsplit("/", 1)[-1]
-
-    def _split_server_name(self, server_path: str):
-        service_path, server_name = server_path.rsplit("/", 1)
-        service_name = self._split_service_name(service_path)
-        return service_path, service_name, server_name
-
     async def _close_channel(self, server: ServerInfo):
         if server and isinstance(server, ServerInfo):
             ch = server.channel
             await ch.close(self.channel_grace)
 
-    def child_watcher(self, event: WatchedEvent):
-        asyncio.set_event_loop(self.loop)
-
-        service_name = self._split_service_name(event.path)
-        if event.type == EventType.CHILD:
-            # update
-            childs = self._kz_client.get_children(event.path, watch=self.child_watcher)
-            with self._locks[service_name]:
-                fetched_servers = self.services[service_name].keys()
-                new_servers = set(childs)
-                expr_servers = fetched_servers - new_servers  # servers to delete
-                for server in new_servers:
-                    if server in fetched_servers:
-                        continue
-                    self.set_channel(service_path=event.path, child_name=server, service_name=service_name)
-
-                _sers = [self.services[service_name].pop(server, None) for server in expr_servers]
-
-            fus = list()
-            for _ser in _sers:
-                fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
-                fus.append(fu)
-            wait(fus)
-
-        elif event.type == EventType.DELETED:
-            # delete
-            with self._locks[service_name]:
-                _sers = self.services.pop(service_name, [])
-                self._locks.pop(service_name, None)
-            fus = list()
-            for _ser in _sers:
-                fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
-                fus.append(fu)
-            wait(fus)
-
-    def child_value_watcher(self, event: WatchedEvent):
-        asyncio.set_event_loop(self.loop)
-
-        if event.type == EventType.CHANGED:
-            # update
-            service_path, service_name, server_name = self._split_server_name(event.path)
-            self.set_channel(service_path=service_path, child_name=server_name, service_name=service_name)
-
-        elif event.type == EventType.DELETED:
-            # delete
-            # do nothing, child_watcher will handle all the things
-            pass
-
-    def set_channel(self, service_path: str, child_name: str, service_name: str,
-                    loop: Optional[asyncio.AbstractEventLoop]= None):
-        if loop is not None:
-            asyncio.set_event_loop(loop)
-
-        child_path = "/".join((service_path, child_name))
-        data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
-        server_addr = data.decode("utf-8")
-
-        ori_ser_info = self.services[service_name].get(child_name)
-        if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
-            ori_addr = ori_ser_info.addr
-            if server_addr == ori_addr: return
-
-        channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
-        self.services[service_name].update({child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path)})
+    def _close_channels(self, servers: List[ServerInfo]):
+        fus = list()
+        for _ser in servers:
+            fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
+            fus.append(fu)
+        wait(fus)
 
     async def fetch_servers(self, service_name: str):
 
         service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
-        self._kz_client.ensure_path(service_path)
 
-        childs = self._kz_client.get_children(service_path, watch=self.child_watcher)
+        fu = asyncio.wrap_future(
+            self._thread_pool.submit(self._kz_client.ensure_path,
+                                     service_path)
+        )
+        await fu
+
+        fu = asyncio.wrap_future(
+            self._thread_pool.submit(self._kz_client.get_children,
+                                     path=service_path,
+                                     watch=self.child_watcher)
+        )
+        childs = await fu
 
         if not childs:
             raise NoServerAvailable("There is no available servers for %s" % service_name)
 
-        new_fus = list()
+        fus = list()
         for child in childs:
-            fu = self._thread_pool.submit(self.set_channel,
-                                          service_path=service_path,
-                                          child_name=child,
-                                          service_name=service_name,
-                                          loop=self.loop)
-            new_fu = asyncio.wrap_future(fu)
-            new_fus.append(new_fu)
+            fu = asyncio.wrap_future(
+                self._thread_pool.submit(self.set_channel,
+                                         service_path=service_path,
+                                         child_name=child,
+                                         service_name=service_name,
+                                         loop=self.loop)
+            )
+            fus.append(fu)
 
         # wait for first completed
-        await asyncio.wait(new_fus, return_when=FIRST_COMPLETED)  # Todo: set timeout
+        await asyncio.wait(fus, return_when=FIRST_COMPLETED)  # Todo: set timeout
 
     async def get_channel(self, service_name: str):
         service = self.services.get(service_name)
         if service is None:
-
             with self._locks[service_name]:
                 service = self.services.get(service_name)
                 if service is not None:
@@ -173,14 +108,6 @@ class AIOZKGrpc(object):
                 return self._get_channel(self.services[service_name], service_name)
 
         return self._get_channel(service, service_name)
-
-    def _get_channel(self, service_map: dict, service_name: str):
-
-        servers = service_map.keys()
-        if not servers:
-            raise NoServerAvailable("There is no available servers for %s" % service_name)
-        server = random.choice(list(servers))
-        return service_map[server].channel
 
     async def stop(self):
         servers = list()
