@@ -2,7 +2,7 @@
 import random
 import threading
 import asyncio
-from typing import Union, Optional, List
+from typing import Union, Optional, List, cast
 from inspect import isclass
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from collections import defaultdict
@@ -140,7 +140,7 @@ class ZKGrpc(ZKGrpcMixin):
             service_name = "".join(class_name.rsplit("Stub", 1))
 
         channel = self.get_channel(service_name)
-        return stub_class(channel)
+        return cast(stub_class, stub_class(channel))
 
     def _close_channel(self, server: ServerInfo):
         if server and isinstance(server, ServerInfo):

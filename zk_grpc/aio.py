@@ -1,6 +1,6 @@
 # coding=utf-8
 import asyncio
-from typing import Union, Optional, List
+from typing import Union, Optional, List, cast
 from inspect import isclass
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
@@ -41,14 +41,14 @@ class AIOZKGrpc(ZKGrpcMixin):
     @loop.setter
     def loop(self, value):
         self._loop = value
-
     async def wrap_stub(self, stub_class: StubClass, service_name: str = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
 
         channel = await self.get_channel(service_name)
-        return stub_class(channel)
+
+        return cast(stub_class, stub_class(channel))
 
     async def _close_channel(self, server: ServerInfo):
         if server and isinstance(server, ServerInfo):
