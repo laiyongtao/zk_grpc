@@ -41,6 +41,7 @@ class AIOZKGrpc(ZKGrpcMixin):
     @loop.setter
     def loop(self, value):
         self._loop = value
+
     async def wrap_stub(self, stub_class: StubClass, service_name: str = None):
         if not service_name:
             class_name = stub_class.__name__

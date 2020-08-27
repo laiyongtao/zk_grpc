@@ -9,21 +9,10 @@ from zk_grpc.aio import AIOZKGrpc
 
 async def run():
     # before useing
-    # kz = KazooClient(hosts="127.0.0.1:2181")
-    kz = KazooClient(hosts="192.168.5.113:2181,192.168.5.113:2182,192.168.5.113:2183")
+    kz = KazooClient(hosts="127.0.0.1:2181")
 
-    print(kz.state)
-    kz.restart()
-    print(kz.state)
+    kz.start()
 
-    kz.stop()
-    print(kz.state)
-
-    kz.close()
-    print(kz.state)
-
-    kz.restart()
-    print(kz.state)
     zk_g = AIOZKGrpc(kz_client=kz)
     zk_g.loop = asyncio.get_event_loop()
 
