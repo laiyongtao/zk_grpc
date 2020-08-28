@@ -11,7 +11,7 @@ from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
                          StubClass, ServicerClass)
-from . import ZKGrpcMixin
+from . import ZKGrpcMixin, ZKRegisterMixin
 
 
 class AIOZKGrpc(ZKGrpcMixin):
@@ -118,20 +118,7 @@ class AIOZKGrpc(ZKGrpcMixin):
         await asyncio.wait(servers)
 
 
-class AIOZKRegister(object):
-
-    def __init__(self, kz_client: KazooClient,
-                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
-                 thread_pool: Optional[ThreadPoolExecutor] = None):
-
-        self._kz_client = kz_client
-        self.zk_root_path = zk_root_path
-        self.node_prefix = node_prefix
-
-        self._creted_nodes = set()
-        self._services = set()
-
-        self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
+class AIOZKRegister(ZKRegisterMixin):
 
     async def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
         value_str = "{}:{}".format(host, port)
@@ -145,16 +132,6 @@ class AIOZKRegister(object):
                                       service_name=service_name,
                                       value=value_str)
         await asyncio.wrap_future(fu)
-
-    def _create_server_node(self, service_name: str, value: Union[str, bytes]):
-        if not isinstance(value, bytes):
-            value = value.encode("utf-8")
-        service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
-        if service_path not in self._services:
-            self._kz_client.ensure_path(service_path)
-        path = "/".join((service_path, self.node_prefix.strip("/")))
-        path = self._kz_client.create(path, value, ephemeral=True, sequence=True)
-        self._creted_nodes.add(path)
 
     async def stop(self):
         fus = list()

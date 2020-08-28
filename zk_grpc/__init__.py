@@ -17,6 +17,31 @@ from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          NoServerAvailable,
                          StubClass, ServicerClass)
 
+class ZKRegisterMixin(object):
+
+    def __init__(self, kz_client: KazooClient,
+                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
+                 thread_pool: Optional[ThreadPoolExecutor] = None):
+
+        self._kz_client = kz_client
+        self.zk_root_path = zk_root_path
+        self.node_prefix = node_prefix
+
+        self._creted_nodes = set()
+        self._services = set()
+
+        self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
+
+    def _create_server_node(self, service_name: str, value: Union[str, bytes]):
+        if not isinstance(value, bytes):
+            value = value.encode("utf-8")
+        service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
+        if service_path not in self._services:
+            self._kz_client.ensure_path(service_path)
+        path = "/".join((service_path, self.node_prefix.strip("/")))
+        path = self._kz_client.create(path, value, ephemeral=True, sequence=True)
+        self._creted_nodes.add(path)
+
 
 class ZKGrpcMixin(object):
 
@@ -190,23 +215,17 @@ class ZKGrpc(ZKGrpcMixin):
                 self._close_channel(_ser)
 
 
-class ZKRegister(object):
-
-    def __init__(self, kz_client: KazooClient,
-                 zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX):
-
-        self._kz_client = kz_client
-        self.zk_root_path = zk_root_path
-        self.node_prefix = node_prefix
-
-        self._creted_nodes = set()
-        self._services = set()
+class ZKRegister(ZKRegisterMixin):
 
     def register_grpc_server(self, server: grpc._server._Server, host: str, port: int):
         value_str = "{}:{}".format(host, port)
+        fus = list()
         for s in server._state.generic_handlers:
             service_name = s.service_name()
-            self._create_server_node(service_name=service_name, value=value_str)
+            fu = self._thread_pool.submit(self._create_server_node,
+                                          service_name=service_name, value=value_str)
+            fus.append(fu)
+        wait(fus)
 
     def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
         value_str = "{}:{}".format(host, port)
@@ -218,16 +237,6 @@ class ZKRegister(object):
             service_name = str(service)
 
         self._create_server_node(service_name=service_name, value=value_str)
-
-    def _create_server_node(self, service_name: str, value: Union[str, bytes]):
-        if not isinstance(value, bytes):
-            value = value.encode("utf-8")
-        service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
-        if service_path not in self._services:
-            self._kz_client.ensure_path(service_path)
-        path = "/".join((service_path, self.node_prefix.strip("/")))
-        path = self._kz_client.create(path, value, ephemeral=True, sequence=True)
-        self._creted_nodes.add(path)
 
     def stop(self):
         rets = list()
