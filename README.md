@@ -3,6 +3,8 @@ a zookeeper registration center manager for python grpcio
 
 Requires: Python 3.5, grpcio, kazoo
 
+##### [More Eaxmples](https://github.com/laiyongtao/zk_grpc/tree/master/example)
+
 ## Service Register
 ```python
 import signal
@@ -93,4 +95,3 @@ def run():
 if __name__ == '__main__':
     run()
 ```
-##### [More Eaxmples](https://github.com/laiyongtao/zk_grpc/tree/master/example)
