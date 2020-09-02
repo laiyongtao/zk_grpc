@@ -61,7 +61,7 @@ class AIOZKGrpc(ZKGrpcMixin):
         for _ser in servers:
             fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
             fus.append(fu)
-        wait(fus)
+        if fus: wait(fus)
 
     async def fetch_servers(self, service_name: str):
 
@@ -115,7 +115,7 @@ class AIOZKGrpc(ZKGrpcMixin):
         for _, _sers in self.services.items():
             servers.extend((self._close_channel(_ser) for _ser in _sers))
         self.services.clear()
-        await asyncio.wait(servers)
+        if servers: await asyncio.wait(servers)
 
 
 class AIOZKRegister(ZKRegisterMixin):
@@ -139,4 +139,4 @@ class AIOZKRegister(ZKRegisterMixin):
             fu = self._thread_pool.submit(self._kz_client.delete, node)
             new_fu = asyncio.wrap_future(fu)
             fus.append(new_fu)
-        await asyncio.wait(fus)
+        if fus: await asyncio.wait(fus)

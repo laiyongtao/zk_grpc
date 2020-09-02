@@ -17,6 +17,7 @@ from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          NoServerAvailable,
                          StubClass, ServicerClass)
 
+
 class ZKRegisterMixin(object):
 
     def __init__(self, kz_client: KazooClient,
@@ -225,7 +226,7 @@ class ZKRegister(ZKRegisterMixin):
             fu = self._thread_pool.submit(self._create_server_node,
                                           service_name=service_name, value=value_str)
             fus.append(fu)
-        wait(fus)
+        if fus: wait(fus)
 
     def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
         value_str = "{}:{}".format(host, port)
