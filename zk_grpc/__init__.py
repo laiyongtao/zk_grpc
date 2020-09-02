@@ -85,10 +85,12 @@ class ZKGrpcMixin(object):
         data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
         server_addr = data.decode("utf-8")
 
-        ori_ser_info = self.services[service_name].get(child_name)
-        if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
-            ori_addr = ori_ser_info.addr
-            if server_addr == ori_addr: return
+        servers = self.services.get(service_name)
+        if servers is not None:
+            ori_ser_info = servers.get(child_name)
+            if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
+                ori_addr = ori_ser_info.addr
+                if server_addr == ori_addr: return
 
         channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
         self.services[service_name].update({child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path)})
