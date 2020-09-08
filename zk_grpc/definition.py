@@ -1,4 +1,5 @@
 # coding=utf-8
+from enum import IntEnum
 from collections import namedtuple
 from typing import Type, TypeVar
 
@@ -16,3 +17,8 @@ ServerInfo = namedtuple("Server", "channel addr path")
 
 class NoServerAvailable(Exception):
     pass
+
+
+class LBS(IntEnum):
+    RANDOM = 1
+    WEIGHTED_RANDOM = 2
