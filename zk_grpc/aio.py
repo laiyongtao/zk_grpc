@@ -10,7 +10,8 @@ from kazoo.client import KazooClient
 from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
-                         StubClass, ServicerClass)
+                         StubClass, ServicerClass,
+                         LBS)
 from . import ZKGrpcMixin, ZKRegisterMixin
 
 
@@ -24,12 +25,14 @@ class AIOZKGrpc(ZKGrpcMixin):
                  channel_factory_kwargs: dict = None,
                  grace: Optional[float] = None,
                  thread_pool: Optional[ThreadPoolExecutor] = None,
-                 loop: Optional[asyncio.AbstractEventLoop] = None):
+                 loop: Optional[asyncio.AbstractEventLoop] = None,
+                 lbs: Optional[LBS] = None):
 
         super(AIOZKGrpc, self).__init__(kz_client=kz_client,
                                         zk_root_path=zk_root_path, node_prefix=node_prefix,
                                         channel_factory=channel_factory, channel_factory_kwargs=channel_factory_kwargs,
-                                        thread_pool=thread_pool)
+                                        thread_pool=thread_pool,
+                                        lbs=lbs)
         self.channel_grace = grace
         self._loop = loop
         self._is_aio = True
@@ -42,12 +45,12 @@ class AIOZKGrpc(ZKGrpcMixin):
     def loop(self, value):
         self._loop = value
 
-    async def wrap_stub(self, stub_class: StubClass, service_name: str = None):
+    async def wrap_stub(self, stub_class: StubClass, service_name: str = None, lbs: Optional[LBS] = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
 
-        channel = await self.get_channel(service_name)
+        channel = await self.get_channel(service_name, lbs=lbs)
 
         return cast(stub_class, stub_class(channel))
 
@@ -97,7 +100,7 @@ class AIOZKGrpc(ZKGrpcMixin):
         # wait for first completed
         await asyncio.wait(fus, return_when=FIRST_COMPLETED)  # Todo: set timeout
 
-    async def get_channel(self, service_name: str):
+    async def get_channel(self, service_name: str, lbs: Optional[LBS] = None):
         service = self.services.get(service_name)
         if service is None:
             with self._locks[service_name]:
@@ -106,9 +109,9 @@ class AIOZKGrpc(ZKGrpcMixin):
                     return self._get_channel(service, service_name)
                 # get server from zk
                 await self.fetch_servers(service_name)
-                return self._get_channel(self.services[service_name], service_name)
+                return self._get_channel(self.services[service_name], service_name, lbs=lbs)
 
-        return self._get_channel(service, service_name)
+        return self._get_channel(service, service_name, lbs=lbs)
 
     async def stop(self):
         servers = list()

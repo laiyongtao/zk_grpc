@@ -20,5 +20,6 @@ class NoServerAvailable(Exception):
 
 
 class LBS(IntEnum):
+    '''Load balancing strategy enum'''
     RANDOM = 1
     WEIGHTED_RANDOM = 2

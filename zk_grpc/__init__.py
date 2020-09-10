@@ -15,7 +15,8 @@ from kazoo.protocol.states import EventType, WatchedEvent
 from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
-                         StubClass, ServicerClass)
+                         StubClass, ServicerClass,
+                         LBS)
 
 
 class ZKRegisterMixin(object):
@@ -53,7 +54,8 @@ class ZKGrpcMixin(object):
                      grpc.experimental.aio.insecure_channel, grpc.experimental.aio.secure_channel
                  ] = grpc.insecure_channel,
                  channel_factory_kwargs: dict = None,
-                 thread_pool: Optional[ThreadPoolExecutor] = None, ):
+                 thread_pool: Optional[ThreadPoolExecutor] = None,
+                 lbs: Optional[LBS] = None):
         self._kz_client = kz_client
         self.zk_root_path = zk_root_path
         self.node_prefix = node_prefix
@@ -67,6 +69,8 @@ class ZKGrpcMixin(object):
         self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
         self._is_aio = False
         self.loop = None
+
+        self.lbs = lbs or LBS.RANDOM
 
     def _split_service_name(self, service_path: str):
         return service_path.rsplit("/", 1)[-1]
@@ -95,10 +99,14 @@ class ZKGrpcMixin(object):
         channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
         self.services[service_name].update({child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path)})
 
-    def _get_channel(self, service_map: dict, service_name: str):
-        servers = service_map.keys()
-        if not servers:
+    def _get_channel(self, service_map: dict, service_name: str,  lbs: Optional[LBS] = None):
+        lbs = lbs or self.lbs
+        if not isinstance(lbs, LBS):
+            raise TypeError("Arg: lbs should be a member of zk_grpc.LBS")
+        if not service_map:
             raise NoServerAvailable("There is no available servers for %s" % service_name)
+        # TODO: Load balancing strategy
+        servers = service_map.keys()
         server = random.choice(list(servers))
         return service_map[server].channel
 
@@ -156,18 +164,20 @@ class ZKGrpc(ZKGrpcMixin):
                  zk_root_path: str = ZK_ROOT_PATH, node_prefix: str = SNODE_PREFIX,
                  channel_factory: Union[grpc.insecure_channel, grpc.secure_channel] = grpc.insecure_channel,
                  channel_factory_kwargs: dict = None,
-                 thread_pool: Optional[ThreadPoolExecutor] = None):
+                 thread_pool: Optional[ThreadPoolExecutor] = None,
+                 lbs: Optional[LBS] = None):
         super(ZKGrpc, self).__init__(kz_client=kz_client,
                                      zk_root_path=zk_root_path, node_prefix=node_prefix,
                                      channel_factory=channel_factory, channel_factory_kwargs=channel_factory_kwargs,
-                                     thread_pool=thread_pool)
+                                     thread_pool=thread_pool,
+                                     lbs=lbs)
 
-    def wrap_stub(self, stub_class: StubClass, service_name: str = None):
+    def wrap_stub(self, stub_class: StubClass, service_name: str = None, lbs: Optional[LBS] = None):
         if not service_name:
             class_name = stub_class.__name__
             service_name = "".join(class_name.rsplit("Stub", 1))
 
-        channel = self.get_channel(service_name)
+        channel = self.get_channel(service_name, lbs=lbs)
         return cast(stub_class, stub_class(channel))
 
     def _close_channel(self, server: ServerInfo):
@@ -198,7 +208,7 @@ class ZKGrpc(ZKGrpcMixin):
             fus.append(fu)
         wait(fus, return_when=FIRST_COMPLETED)  # Todo: set timeout
 
-    def get_channel(self, service_name: str):
+    def get_channel(self, service_name: str, lbs: Optional[LBS] = None):
         service = self.services.get(service_name)
         if service is None:
 
@@ -208,9 +218,9 @@ class ZKGrpc(ZKGrpcMixin):
                     return self._get_channel(service, service_name)
                 # get server from zk
                 self.fetch_servers(service_name)
-                return self._get_channel(self.services[service_name], service_name)
+                return self._get_channel(self.services[service_name], service_name, lbs=lbs)
 
-        return self._get_channel(service, service_name)
+        return self._get_channel(service, service_name, lbs=lbs)
 
     def stop(self):
         for _, _sers in self.services.items():
