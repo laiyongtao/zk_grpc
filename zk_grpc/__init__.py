@@ -16,7 +16,7 @@ from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
                          StubClass, ServicerClass,
-                         LBS)
+                         LBS, W_VALUE_RE, VALUE_RE, DEFAILT_WEIGHT)
 
 
 class ZKRegisterMixin(object):
@@ -87,8 +87,15 @@ class ZKGrpcMixin(object):
 
         child_path = "/".join((service_path, child_name))
         data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
-        server_addr = data.decode("utf-8")
-
+        data = data.decode("utf-8")
+        weight_re_ret = W_VALUE_RE.match(data)
+        old_re_ret = VALUE_RE.match(data)
+        if weight_re_ret:
+            server_addr, weight = weight_re_ret.groups()
+        elif old_re_ret:
+            server_addr, weight = old_re_ret.group(), DEFAILT_WEIGHT
+        else:
+            return
         servers = self.services.get(service_name)
         if servers is not None:
             ori_ser_info = servers.get(child_name)
@@ -97,7 +104,9 @@ class ZKGrpcMixin(object):
                 if server_addr == ori_addr: return
 
         channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
-        self.services[service_name].update({child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path)})
+        self.services[service_name].update(
+            {child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path, weight=weight)}
+        )
 
     def _get_channel(self, service_map: dict, service_name: str,  lbs: Optional[LBS] = None):
         lbs = lbs or self.lbs
@@ -230,8 +239,8 @@ class ZKGrpc(ZKGrpcMixin):
 
 class ZKRegister(ZKRegisterMixin):
 
-    def register_grpc_server(self, server: grpc._server._Server, host: str, port: int):
-        value_str = "{}:{}".format(host, port)
+    def register_grpc_server(self, server: grpc._server._Server, host: str, port: int, weight: int = DEFAILT_WEIGHT):
+        value_str = "{}:{}||{}".format(host, port, weight)
         fus = list()
         for s in server._state.generic_handlers:
             service_name = s.service_name()
@@ -240,8 +249,8 @@ class ZKRegister(ZKRegisterMixin):
             fus.append(fu)
         if fus: wait(fus)
 
-    def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
-        value_str = "{}:{}".format(host, port)
+    def register_server(self, service: Union[ServicerClass, str], host: str, port: int, weight: int = DEFAILT_WEIGHT):
+        value_str = "{}:{}||{}".format(host, port, weight)
 
         if isclass(service):
             class_name = service.__name__

@@ -11,7 +11,7 @@ from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
                          StubClass, ServicerClass,
-                         LBS)
+                         LBS, DEFAILT_WEIGHT)
 from . import ZKGrpcMixin, ZKRegisterMixin
 
 
@@ -123,8 +123,9 @@ class AIOZKGrpc(ZKGrpcMixin):
 
 class AIOZKRegister(ZKRegisterMixin):
 
-    async def register_server(self, service: Union[ServicerClass, str], host: str, port: int):
-        value_str = "{}:{}".format(host, port)
+    async def register_server(self, service: Union[ServicerClass, str],
+                              host: str, port: int, weight: int = DEFAILT_WEIGHT):
+        value_str = value_str = "{}:{}||{}".format(host, port, weight)
 
         if isclass(service):
             class_name = service.__name__
