@@ -125,7 +125,7 @@ class AIOZKRegister(ZKRegisterMixin):
 
     async def register_server(self, service: Union[ServicerClass, str],
                               host: str, port: int, weight: int = DEFAILT_WEIGHT):
-        value_str = value_str = "{}:{}||{}".format(host, port, weight)
+        value_str = "{}:{}||{}".format(host, port, weight)
 
         if isclass(service):
             class_name = service.__name__
