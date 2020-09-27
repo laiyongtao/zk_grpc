@@ -29,3 +29,23 @@ class LBS(IntEnum):
 
 class NoServerAvailable(Exception):
     pass
+
+
+class InitServiceFlag(object):
+
+    def __init__(self, path: str):
+        self._flag = False
+        self._path = path
+
+    def is_set(self):
+        return self._flag
+
+    def set(self):
+        self._flag = True
+
+    def clear(self):
+        self._flag = False
+
+    @property
+    def path(self):
+        return self._path
