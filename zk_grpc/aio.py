@@ -77,9 +77,8 @@ class AIOZKGrpc(ZKGrpcMixin):
         await fu
 
         fu = asyncio.wrap_future(
-            self._thread_pool.submit(self._kz_client.get_children,
-                                     path=service_path,
-                                     watch=self.child_watcher)
+            self._thread_pool.submit(self.get_children,
+                                     path=service_path)
         )
         childs = await fu
 
@@ -89,11 +88,9 @@ class AIOZKGrpc(ZKGrpcMixin):
         fus = list()
         for child in childs:
             fu = asyncio.wrap_future(
-                self._thread_pool.submit(self.set_channel,
+                self._thread_pool.submit(self.set_server,
                                          service_path=service_path,
-                                         child_name=child,
-                                         service_name=service_name,
-                                         loop=self.loop)
+                                         child_name=child)
             )
             fus.append(fu)
 
@@ -132,10 +129,11 @@ class AIOZKRegister(ZKRegisterMixin):
             service_name = "".join(class_name.rsplit("Servicer", 1))
         else:
             service_name = str(service)
-        fu = self._thread_pool.submit(self._create_server_node,
+        await asyncio.wrap_future(
+            self._thread_pool.submit(self._create_server_node,
                                       service_name=service_name,
                                       value=value_str)
-        await asyncio.wrap_future(fu)
+        )
 
     async def stop(self):
         fus = list()

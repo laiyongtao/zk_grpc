@@ -6,16 +6,17 @@ from typing import Union, Optional, List, cast
 from inspect import isclass
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from collections import defaultdict
+from functools import partial
 
 import grpc.experimental.aio
 from grpc._server import _Server
 from kazoo.client import KazooClient
-from kazoo.protocol.states import EventType, WatchedEvent
+from kazoo.protocol.states import EventType, WatchedEvent, ZnodeStat
 
 from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
                          NoServerAvailable,
-                         StubClass, ServicerClass,
+                         StubClass, ServicerClass, InitServiceFlag,
                          LBS, W_VALUE_RE, VALUE_RE, DEFAILT_WEIGHT)
 
 
@@ -82,6 +83,7 @@ class ZKGrpcMixin(object):
 
     def set_channel(self, service_path: str, child_name: str, service_name: str,
                     loop: Optional[asyncio.AbstractEventLoop] = None):
+        '''obsolete'''
         if loop is not None:
             asyncio.set_event_loop(loop)
 
@@ -124,6 +126,7 @@ class ZKGrpcMixin(object):
         pass
 
     def child_value_watcher(self, event: WatchedEvent):
+        '''obsolete'''
         if self._is_aio:
             asyncio.set_event_loop(self.loop)
 
@@ -137,7 +140,86 @@ class ZKGrpcMixin(object):
             # do nothing, child_watcher will handle all the things
             pass
 
+    def set_server(self, service_path: str, child_name: str):
+        child_path = "/".join((service_path, child_name))
+        watcher = partial(self.data_watcher, path=child_path)
+        self._kz_client.DataWatch(child_path, func=watcher)
+
+    def data_watcher(self, data: Optional[bytes], stat: Optional[ZnodeStat], event: Optional[WatchedEvent], path: str):
+        if event is None or event.type == EventType.CHANGED:
+            if stat is None:
+                return False
+            self._set_channel(data, path)
+        elif event.type == EventType.DELETED or event.type == EventType.NONE:
+            return False
+
+    def _set_channel(self, data: bytes, path: str):
+        if self._is_aio:
+            asyncio.set_event_loop(self.loop)
+
+        service_path, service_name, server_name = self._split_server_name(path)
+
+        data = data.decode("utf-8")
+        weight_re_ret = W_VALUE_RE.match(data)
+        old_re_ret = VALUE_RE.match(data)
+        if weight_re_ret:
+            server_addr, weight = weight_re_ret.groups()
+        elif old_re_ret:
+            server_addr, weight = old_re_ret.group(), DEFAILT_WEIGHT
+        else:
+            return
+        servers = self.services.get(service_name)
+        if servers is not None:
+            ori_ser_info = servers.get(server_name)
+            if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
+                ori_addr = ori_ser_info.addr
+                if server_addr == ori_addr: return
+
+        channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
+        self.services[service_name].update(
+            {server_name: ServerInfo(channel=channel, addr=server_addr, path=path, weight=weight)}
+        )
+
+    def get_children(self, path: str):
+        watcher = partial(self.children_watcher, init_flag=InitServiceFlag(path))
+        child_watcher = self._kz_client.ChildrenWatch(path, func=watcher, send_event=True)
+
+        return child_watcher._prior_children
+
+    def children_watcher(self, childs: list, event: WatchedEvent, init_flag: InitServiceFlag):
+        if not init_flag.is_set():
+            init_flag.set()
+            return
+
+        path = init_flag.path
+        service_name = self._split_service_name(path)
+
+        if event is None or event.type == EventType.CHILD:
+            # update
+            with self._locks[service_name]:
+                fetched_servers = self.services[service_name].keys()
+                new_servers = set(childs)
+                expr_servers = fetched_servers - new_servers  # servers to delete
+                for server in new_servers:
+                    if server in fetched_servers:
+                        continue
+                    self.set_server(service_path=path, child_name=server)
+
+                _sers = [self.services[service_name].pop(server, None) for server in expr_servers]
+
+            self._close_channels(_sers)
+
+        elif event.type == EventType.DELETED:
+            # delete
+            with self._locks[service_name]:
+                _sers = self.services.pop(service_name, [])
+                self._locks.pop(service_name, None)
+
+            self._close_channels(_sers)
+            return False  # to remove watcher
+
     def child_watcher(self, event: WatchedEvent):
+        '''obsolete'''
         if self._is_aio:
             asyncio.set_event_loop(self.loop)
 
@@ -203,17 +285,16 @@ class ZKGrpc(ZKGrpcMixin):
         service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
         self._kz_client.ensure_path(service_path)
 
-        childs = self._kz_client.get_children(service_path, watch=self.child_watcher)
+        childs = self.get_children(path=service_path)
 
         if not childs:
             raise NoServerAvailable("There is no available servers for %s" % service_name)
 
         fus = list()
         for child in childs:
-            fu = self._thread_pool.submit(self.set_channel,
+            fu = self._thread_pool.submit(self.set_server,
                                           service_path=service_path,
-                                          child_name=child,
-                                          service_name=service_name)
+                                          child_name=child)
             fus.append(fu)
         wait(fus, return_when=FIRST_COMPLETED)  # Todo: set timeout
 
