@@ -2,7 +2,7 @@
 import random
 import threading
 import asyncio
-from typing import Union, Optional, List, cast
+from typing import Union, Optional, cast, Iterable
 from inspect import isclass
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from collections import defaultdict
@@ -11,7 +11,7 @@ from functools import partial
 import grpc.experimental.aio
 from grpc._server import _Server
 from kazoo.client import KazooClient
-from kazoo.protocol.states import EventType, WatchedEvent, ZnodeStat
+from kazoo.protocol.states import EventType, WatchedEvent, ZnodeStat, KazooState
 
 from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          ServerInfo,
@@ -31,19 +31,36 @@ class ZKRegisterMixin(object):
         self.node_prefix = node_prefix
 
         self._creted_nodes = set()
-        self._services = set()
+        self._lock = threading.RLock()
+        self._stopped = False
 
         self._thread_pool = thread_pool or ThreadPoolExecutor()  # for running sync func in main thread
+        self._kz_client.add_listener(self._session_watcher)
 
     def _create_server_node(self, service_name: str, value: Union[str, bytes]):
         if not isinstance(value, bytes):
             value = value.encode("utf-8")
         service_path = "/".join((self.zk_root_path.rstrip("/"), service_name))
-        if service_path not in self._services:
-            self._kz_client.ensure_path(service_path)
-        path = "/".join((service_path, self.node_prefix.strip("/")))
-        path = self._kz_client.create(path, value, ephemeral=True, sequence=True)
-        self._creted_nodes.add(path)
+        pre_path = "/".join((service_path, self.node_prefix.strip("/")))
+        path = self._kz_client.create(pre_path, value, ephemeral=True, sequence=True, makepath=True)
+        self._creted_nodes.add((service_name, path, value))
+
+    def _session_watcher(self, state):
+        if state == KazooState.CONNECTED and not self._stopped:
+            self._kz_client.handler.spawn(self.resume_nodes)
+
+    def resume_nodes(self):
+        with self._lock:
+            expired = set()
+            created = self._creted_nodes.copy()
+            for node in created:
+                service_name, path, value = node
+                stat = self._kz_client.exists(path)
+                if stat:
+                    continue
+                expired.add(node)
+                self._create_server_node(service_name=service_name, value=value)
+            self._creted_nodes.difference_update(expired)
 
 
 class ZKGrpcMixin(object):
@@ -81,36 +98,7 @@ class ZKGrpcMixin(object):
         service_name = self._split_service_name(service_path)
         return service_path, service_name, server_name
 
-    def set_channel(self, service_path: str, child_name: str, service_name: str,
-                    loop: Optional[asyncio.AbstractEventLoop] = None):
-        '''obsolete'''
-        if loop is not None:
-            asyncio.set_event_loop(loop)
-
-        child_path = "/".join((service_path, child_name))
-        data, _ = self._kz_client.get(child_path, watch=self.child_value_watcher)
-        data = data.decode("utf-8")
-        weight_re_ret = W_VALUE_RE.match(data)
-        old_re_ret = VALUE_RE.match(data)
-        if weight_re_ret:
-            server_addr, weight = weight_re_ret.groups()
-        elif old_re_ret:
-            server_addr, weight = old_re_ret.group(), DEFAILT_WEIGHT
-        else:
-            return
-        servers = self.services.get(service_name)
-        if servers is not None:
-            ori_ser_info = servers.get(child_name)
-            if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
-                ori_addr = ori_ser_info.addr
-                if server_addr == ori_addr: return
-
-        channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
-        self.services[service_name].update(
-            {child_name: ServerInfo(channel=channel, addr=server_addr, path=child_path, weight=weight)}
-        )
-
-    def _get_channel(self, service_map: dict, service_name: str,  lbs: Optional[LBS] = None):
+    def _get_channel(self, service_map: dict, service_name: str, lbs: Optional[LBS] = None):
         lbs = lbs or self.lbs
         if not isinstance(lbs, LBS):
             raise TypeError("Arg: lbs should be a member of zk_grpc.LBS")
@@ -121,24 +109,9 @@ class ZKGrpcMixin(object):
         server = random.choice(list(servers))
         return service_map[server].channel
 
-    def _close_channels(self, servers: List[ServerInfo]):
+    def _close_channels(self, servers: Iterable[ServerInfo]):
         # close grpc channels in subthread
         pass
-
-    def child_value_watcher(self, event: WatchedEvent):
-        '''obsolete'''
-        if self._is_aio:
-            asyncio.set_event_loop(self.loop)
-
-        if event.type == EventType.CHANGED:
-            # update
-            service_path, service_name, server_name = self._split_server_name(event.path)
-            self.set_channel(service_path=service_path, child_name=server_name, service_name=service_name)
-
-        elif event.type == EventType.DELETED:
-            # delete
-            # do nothing, child_watcher will handle all the things
-            pass
 
     def set_server(self, service_path: str, child_name: str):
         child_path = "/".join((service_path, child_name))
@@ -146,11 +119,16 @@ class ZKGrpcMixin(object):
         self._kz_client.DataWatch(child_path, func=watcher)
 
     def data_watcher(self, data: Optional[bytes], stat: Optional[ZnodeStat], event: Optional[WatchedEvent], path: str):
-        if event is None or event.type == EventType.CHANGED:
+        if event is None or event.type == EventType.CHANGED or event.type == EventType.NONE:
             if stat is None:
+                _, service_name, server_name = self._split_server_name(path)
+                services = self.services.get(service_name)
+                if services is not None:
+                    s_info = services.pop(server_name, None)
+                    self._close_channels((s_info,))
                 return False
             self._set_channel(data, path)
-        elif event.type == EventType.DELETED or event.type == EventType.NONE:
+        elif event.type == EventType.DELETED:
             return False
 
     def _set_channel(self, data: bytes, path: str):
@@ -168,14 +146,20 @@ class ZKGrpcMixin(object):
             server_addr, weight = old_re_ret.group(), DEFAILT_WEIGHT
         else:
             return
+
         servers = self.services.get(service_name)
+        channel = None
         if servers is not None:
             ori_ser_info = servers.get(server_name)
             if ori_ser_info and isinstance(ori_ser_info, ServerInfo):
-                ori_addr = ori_ser_info.addr
-                if server_addr == ori_addr: return
+                ori_addr, ori_weight = ori_ser_info.addr, ori_ser_info.weight
+                if server_addr == ori_addr and ori_weight == weight:
+                    return
+                elif server_addr == ori_addr:
+                    channel = ori_ser_info.channel
+        if channel is None:
+            channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
 
-        channel = self.channel_factory(server_addr, **self.channel_factory_kwargs)
         self.services[service_name].update(
             {server_name: ServerInfo(channel=channel, addr=server_addr, path=path, weight=weight)}
         )
@@ -186,7 +170,7 @@ class ZKGrpcMixin(object):
 
         return child_watcher._prior_children
 
-    def children_watcher(self, childs: list, event: WatchedEvent, init_flag: InitServiceFlag):
+    def children_watcher(self, childs: list, event: WatchedEvent, init_flag: InitServiceFlag = None):
         if not init_flag.is_set():
             init_flag.set()
             return
@@ -212,41 +196,11 @@ class ZKGrpcMixin(object):
         elif event.type == EventType.DELETED:
             # delete
             with self._locks[service_name]:
-                _sers = self.services.pop(service_name, [])
+                _sers = self.services.pop(service_name, {})
                 self._locks.pop(service_name, None)
 
-            self._close_channels(_sers)
+            self._close_channels(_sers.values())
             return False  # to remove watcher
-
-    def child_watcher(self, event: WatchedEvent):
-        '''obsolete'''
-        if self._is_aio:
-            asyncio.set_event_loop(self.loop)
-
-        service_name = self._split_service_name(event.path)
-        if event.type == EventType.CHILD:
-            # update
-            childs = self._kz_client.get_children(event.path, watch=self.child_watcher)
-            with self._locks[service_name]:
-                fetched_servers = self.services[service_name].keys()
-                new_servers = set(childs)
-                expr_servers = fetched_servers - new_servers  # servers to delete
-                for server in new_servers:
-                    if server in fetched_servers:
-                        continue
-                    self.set_channel(service_path=event.path, child_name=server, service_name=service_name)
-
-                _sers = [self.services[service_name].pop(server, None) for server in expr_servers]
-
-            self._close_channels(_sers)
-
-        elif event.type == EventType.DELETED:
-            # delete
-            with self._locks[service_name]:
-                _sers = self.services.pop(service_name, [])
-                self._locks.pop(service_name, None)
-
-            self._close_channels(_sers)
 
 
 class ZKGrpc(ZKGrpcMixin):
@@ -276,7 +230,7 @@ class ZKGrpc(ZKGrpcMixin):
             ch = server.channel
             ch.close()
 
-    def _close_channels(self, servers: List[ServerInfo]):
+    def _close_channels(self, servers: Iterable[ServerInfo]):
         for _ser in servers:
             self._close_channel(_ser)
 
@@ -323,12 +277,14 @@ class ZKRegister(ZKRegisterMixin):
     def register_grpc_server(self, server: grpc._server._Server, host: str, port: int, weight: int = DEFAILT_WEIGHT):
         value_str = "{}:{}||{}".format(host, port, weight)
         fus = list()
-        for s in server._state.generic_handlers:
-            service_name = s.service_name()
-            fu = self._thread_pool.submit(self._create_server_node,
-                                          service_name=service_name, value=value_str)
-            fus.append(fu)
-        if fus: wait(fus)
+        with self._lock:
+            for s in server._state.generic_handlers:
+                service_name = s.service_name()
+                fu = self._thread_pool.submit(self._create_server_node,
+                                              service_name=service_name, value=value_str)
+                fus.append(fu)
+            if fus:
+                wait(fus)
 
     def register_server(self, service: Union[ServicerClass, str], host: str, port: int, weight: int = DEFAILT_WEIGHT):
         value_str = "{}:{}||{}".format(host, port, weight)
@@ -338,10 +294,11 @@ class ZKRegister(ZKRegisterMixin):
             service_name = "".join(class_name.rsplit("Servicer", 1))
         else:
             service_name = str(service)
-
-        self._create_server_node(service_name=service_name, value=value_str)
+        with self._lock:
+            self._create_server_node(service_name=service_name, value=value_str)
 
     def stop(self):
+        self._stopped = True
         rets = list()
         for node in self._creted_nodes:
             ret = self._kz_client.delete_async(node)

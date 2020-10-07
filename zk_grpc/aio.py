@@ -1,8 +1,8 @@
 # coding=utf-8
 import asyncio
-from typing import Union, Optional, List, cast
+from typing import Union, Optional, cast, Iterable
 from inspect import isclass
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED
 
 import grpc.experimental.aio
 from kazoo.client import KazooClient
@@ -59,12 +59,9 @@ class AIOZKGrpc(ZKGrpcMixin):
             ch = server.channel
             await ch.close(self.channel_grace)
 
-    def _close_channels(self, servers: List[ServerInfo]):
-        fus = list()
+    def _close_channels(self, servers: Iterable[ServerInfo]):
         for _ser in servers:
-            fu = asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
-            fus.append(fu)
-        if fus: wait(fus)
+            asyncio.run_coroutine_threadsafe(self._close_channel(_ser), self.loop)
 
     async def fetch_servers(self, service_name: str):
 
@@ -136,6 +133,7 @@ class AIOZKRegister(ZKRegisterMixin):
         )
 
     async def stop(self):
+        self._stopped = True
         fus = list()
         for node in self._creted_nodes:
             fu = self._thread_pool.submit(self._kz_client.delete, node)
