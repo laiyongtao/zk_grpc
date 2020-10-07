@@ -55,5 +55,6 @@ def run(host, port):
 if __name__ == '__main__':
 
     host = "127.0.0.1"
-    port = 50052
-    run(host, port)
+    from socket_util import reserve_port
+    with reserve_port() as port:
+        run(host, port)
