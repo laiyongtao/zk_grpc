@@ -11,7 +11,7 @@ desc = '''a zookeeper registration center manager for python grpcio'''
 
 setup(
     name="zk-grpc",
-    version="0.0.1",
+    version="0.1.0",
     author="laiyongtao",
     author_email="laiyongtao6908@163.com",
     url="https://github.com/laiyongtao/zk_grpc" ,

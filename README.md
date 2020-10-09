@@ -2,6 +2,10 @@
 a zookeeper registration center manager for python grpcio 
 
 Requires: Python 3.5, grpcio, kazoo
+### install
+```shell
+pip install zk-grpc
+```
 
 ##### [More Eaxmples](https://github.com/laiyongtao/zk_grpc/tree/master/example)
 

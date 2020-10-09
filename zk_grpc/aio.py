@@ -12,7 +12,7 @@ from .definition import (ZK_ROOT_PATH, SNODE_PREFIX,
                          NoServerAvailable,
                          StubClass, ServicerClass,
                          LBS, DEFAILT_WEIGHT)
-from . import ZKGrpcMixin, ZKRegisterMixin
+from .basic import ZKGrpcMixin, ZKRegisterMixin
 
 
 class AIOZKGrpc(ZKGrpcMixin):
@@ -56,8 +56,7 @@ class AIOZKGrpc(ZKGrpcMixin):
 
     async def _close_channel(self, server: ServerInfo):
         if server and isinstance(server, ServerInfo):
-            ch = server.channel
-            await ch.close(self.channel_grace)
+            await server.channel.close(self.channel_grace)
 
     def _close_channels(self, servers: Iterable[ServerInfo]):
         for _ser in servers:
@@ -82,14 +81,13 @@ class AIOZKGrpc(ZKGrpcMixin):
         if not childs:
             raise NoServerAvailable("There is no available servers for %s" % service_name)
 
-        fus = list()
-        for child in childs:
-            fu = asyncio.wrap_future(
+        fus = [
+            asyncio.wrap_future(
                 self._thread_pool.submit(self.set_server,
                                          service_path=service_path,
                                          child_name=child)
-            )
-            fus.append(fu)
+            ) for child in childs
+        ]
 
         # wait for first completed
         await asyncio.wait(fus, return_when=FIRST_COMPLETED)  # Todo: set timeout
@@ -128,15 +126,12 @@ class AIOZKRegister(ZKRegisterMixin):
             service_name = str(service)
         await asyncio.wrap_future(
             self._thread_pool.submit(self._create_server_node,
-                                      service_name=service_name,
-                                      value=value_str)
+                                     service_name=service_name,
+                                     value=value_str)
         )
 
     async def stop(self):
         self._stopped = True
-        fus = list()
-        for node in self._creted_nodes:
-            fu = self._thread_pool.submit(self._kz_client.delete, node)
-            new_fu = asyncio.wrap_future(fu)
-            fus.append(new_fu)
+        fus = [asyncio.wrap_future(self._thread_pool.submit(self._kz_client.delete, path)) for _, path, _ in
+               self._creted_nodes]
         if fus: await asyncio.wait(fus)
