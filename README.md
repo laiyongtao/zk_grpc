@@ -6,6 +6,12 @@ Requires: Python 3.5, grpcio, kazoo
 ```shell
 pip install zk-grpc
 ```
+####How to update 0.0.1 to 0.1.0
+```text
+1. Update the Client server which use with ZKGrpc or AIOZKGrpc to v0.1.0 zk-grpc first.
+2. Then update the server which use with ZKRegister or AIOZKRegister.
+```
+**Notice: Can not use V0.0.1 ZKGrpc class with v0.1.0 ZKRegister class**
 
 ##### [More Eaxmples](https://github.com/laiyongtao/zk_grpc/tree/master/example)
 
