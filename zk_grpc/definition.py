@@ -1,6 +1,6 @@
 # coding=utf-8
 import re
-from enum import IntEnum
+from enum import Enum
 from collections import namedtuple
 from typing import Type, TypeVar
 
@@ -21,10 +21,14 @@ VALUE_RE = re.compile(r"^(.*?:\d+)$")
 DEFAILT_WEIGHT = 10
 
 
-class LBS(IntEnum):
+class LBS(Enum):
     '''Load balancing strategy enum'''
-    RANDOM = 1
-    WEIGHTED_RANDOM = 2
+    RANDOM = "random"
+    WEIGHTED_RANDOM = "weighted_random"
+
+
+class UnregisteredLBSError(Exception):
+    pass
 
 
 class NoServerAvailable(Exception):
@@ -37,15 +41,15 @@ class InitServiceFlag(object):
         self._flag = False
         self._path = path
 
-    def is_set(self):
+    def is_set(self) -> bool:
         return self._flag
 
-    def set(self):
+    def set(self) -> None:
         self._flag = True
 
-    def clear(self):
+    def clear(self) -> None:
         self._flag = False
 
     @property
-    def path(self):
+    def path(self) -> str:
         return self._path
